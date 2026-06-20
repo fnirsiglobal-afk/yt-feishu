@@ -10,6 +10,7 @@ import re
 import asyncio
 import logging
 from datetime import datetime, timezone
+import json
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -523,10 +524,36 @@ async def patch_test(record_id: str):
         
         tests = {}
         
-        # 测试1：PATCH 副本表的这条记录（当前配置）
+        # 测试1：PATCH 副本表的这条记录（当前配置，不显式设置 Content-Type）
         url1 = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{BITABLE_TABLE_ID}/records/{record_id}"
         r1 = await client.patch(url1, headers={"Authorization": f"Bearer {token}"}, json={"fields": {"频道名称": "test"}}, timeout=15)
         tests["patch_current"] = {"url": url1, "status": r1.status_code, "body": r1.text[:200]}
+
+        # 测试1b：同样的 URL，显式加 Content-Type: application/json
+        r1b = await client.patch(
+            url1,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            content=json.dumps({"fields": {"频道名称": "test"}}).encode("utf-8"),
+            timeout=15,
+        )
+        tests["patch_explicit_content_type"] = {"url": url1, "status": r1b.status_code, "body": r1b.text[:200]}
+
+        # 测试1c：用 GET 同样的客户端连接对象，紧接着发 PATCH（排除连接池/keep-alive 问题）
+        r1c_get = await client.get(url1, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        r1c = await client.patch(
+            url1,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            content=json.dumps({"fields": {"频道名称": "test"}}).encode("utf-8"),
+            timeout=15,
+        )
+        tests["get_then_patch_same_client"] = {
+            "get_status": r1c_get.status_code,
+            "patch_status": r1c.status_code,
+            "patch_body": r1c.text[:200],
+        }
 
         # 测试2：PATCH 原表（tblzlTKTH8z2R16P）第一条记录
         url2 = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/tblzlTKTH8z2R16P/records/{record_id}"
