@@ -469,6 +469,26 @@ async def status():
     })
 
 
+@app.get("/admin/test-write/{record_id}")
+async def test_write(record_id: str):
+    """测试对指定 record_id 的写入权限，写入一个测试字段"""
+    async with httpx.AsyncClient() as client:
+        token = await get_feishu_token(client)
+        url = (f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}"
+               f"/tables/{BITABLE_TABLE_ID}/records/{record_id}")
+        r = await client.patch(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            json={"fields": {"频道名称": "写入测试-可删除"}},
+            timeout=15,
+        )
+        try:
+            data = r.json()
+        except Exception:
+            return JSONResponse({"http_status": r.status_code, "raw": r.text[:500]})
+        return JSONResponse({"http_status": r.status_code, "feishu_response": data})
+
+
 @app.get("/admin/debug-records")
 async def debug_records():
     """列出表格前5条记录的真实 record_id，用于排查"""
