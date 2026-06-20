@@ -236,7 +236,7 @@ async def update_record(client: httpx.AsyncClient, token: str,
                         record_id: str, fields: dict):
     url = (f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}"
            f"/tables/{BITABLE_TABLE_ID}/records/{record_id}")
-    r = await client.patch(
+    r = await client.put(
         url,
         headers={"Authorization": f"Bearer {token}"},
         json={"fields": fields},
