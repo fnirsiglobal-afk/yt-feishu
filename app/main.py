@@ -469,6 +469,36 @@ async def status():
     })
 
 
+@app.get("/admin/debug-records")
+async def debug_records():
+    """列出表格前5条记录的真实 record_id，用于排查"""
+    async with httpx.AsyncClient() as client:
+        token = await get_feishu_token(client)
+        url = (f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}"
+               f"/tables/{BITABLE_TABLE_ID}/records?page_size=5")
+        r = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        try:
+            data = r.json()
+        except Exception:
+            return JSONResponse({"error": f"HTTP {r.status_code}", "body": r.text[:500]})
+        
+        if data.get("code") != 0:
+            return JSONResponse({"feishu_error": data})
+        
+        items = data.get("data", {}).get("items", [])
+        result = []
+        for item in items:
+            result.append({
+                "record_id": item.get("record_id"),
+                "频道链接": item.get("fields", {}).get("频道链接"),
+            })
+        return JSONResponse({"records": result, "total": len(result)})
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
