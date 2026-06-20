@@ -469,6 +469,43 @@ async def status():
     })
 
 
+@app.get("/admin/list-apps")
+async def list_apps():
+    """列出应用有权访问的多维表格，验证 app_token 是否正确"""
+    async with httpx.AsyncClient() as client:
+        token = await get_feishu_token(client)
+        
+        # 直接用 app_token 查询表格元信息
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}"
+        r = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        try:
+            data = r.json()
+        except Exception:
+            data = r.text[:300]
+        
+        # 同时查询表格列表
+        url2 = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables"
+        r2 = await client.get(
+            url2,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        try:
+            data2 = r2.json()
+        except Exception:
+            data2 = r2.text[:300]
+
+        return JSONResponse({
+            "app_token": BITABLE_APP_TOKEN,
+            "get_app_info": {"status": r.status_code, "response": data},
+            "list_tables": {"status": r2.status_code, "response": data2},
+        })
+
+
 @app.get("/admin/test-write/{record_id}")
 async def test_write(record_id: str):
     """测试对指定 record_id 的写入权限，返回完整调试信息"""
