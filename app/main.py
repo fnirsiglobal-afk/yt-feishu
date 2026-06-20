@@ -469,6 +469,35 @@ async def status():
     })
 
 
+@app.get("/admin/deep-patch/{record_id}")
+async def deep_patch(record_id: str):
+    """完整诊断 PATCH 请求，包括 headers、重定向、原始响应"""
+    async with httpx.AsyncClient(follow_redirects=False) as client:
+        token = await get_feishu_token(client)
+        
+        url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}"
+               f"/tables/{BITABLE_TABLE_ID}/records/{record_id}")
+        
+        r = await client.patch(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"fields": {"频道名称": "test123"}},
+            timeout=15,
+        )
+        
+        return JSONResponse({
+            "status":           r.status_code,
+            "url":              url,
+            "response_headers": dict(r.headers),
+            "body":             r.text[:500],
+            "token_len":        len(token),
+            "token_start":      token[:15],
+        })
+
+
 @app.get("/admin/patch-test/{record_id}")
 async def patch_test(record_id: str):
     """最简单的 PATCH 测试，逐步缩小问题范围"""
