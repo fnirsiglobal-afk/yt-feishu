@@ -40,7 +40,9 @@ SCHEDULE_CRON = os.getenv("SCHEDULE_CRON", "0 9 * * *")
 SCHEDULE_TZ   = os.getenv("SCHEDULE_TZ", "Asia/Shanghai")
 
 YT_BASE = "https://www.googleapis.com/youtube/v3"
-FS_BASE = "https://open.feishu.cn/open-apis"
+# 企业专属域名版飞书需要改成对应域名，例如 https://open.qseatj2kzm.feishu.cn/open-apis
+# 标准版保持 https://open.feishu.cn/open-apis
+FS_BASE = os.getenv("FEISHU_API_BASE", "https://open.feishu.cn") + "/open-apis"
 
 # 定时任务运行中防重入锁
 _refresh_lock = asyncio.Lock()
