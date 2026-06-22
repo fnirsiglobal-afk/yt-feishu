@@ -10,6 +10,7 @@ import re
 import asyncio
 import logging
 from datetime import datetime, timezone
+import json
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -215,62 +216,44 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
     return {k: v for k, v in fields.items() if v is not None}
 
 async def fetch_about_page_links(
-    client: httpx.AsyncClient, channel_url: str
+    client: httpx.AsyncClient, channel_url: str  # client 保留签名兼容，实际不用
 ) -> dict:
-    """
-    爬取 YouTube 频道 about 页面，提取社媒链接。
-    YouTube 将 about 页面的链接数据以 JSON 形式嵌入 window.__data__ 或 ytInitialData 中。
-    此处直接对整段 HTML 文本运行正则，避免解析复杂 JSON。
-    """
-    # 构造 about URL：handle / channel / user 格式均兼容
-    if "/about" not in channel_url:
-        about_url = channel_url.rstrip("/") + "/about"
-    else:
-        about_url = channel_url
-
     try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        r = await client.get(about_url, headers=headers, timeout=15,
-                              follow_redirects=True)
-        if r.status_code != 200:
-            logger.warning(f"about 页面请求失败 HTTP {r.status_code}: {about_url}")
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp",
+            "--dump-single-json",
+            "--flat-playlist",
+            "--playlist-items", "0",
+            "--no-warnings",
+            channel_url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            logger.warning(f"yt-dlp 失败 {channel_url}: {stderr.decode()[:300]}")
             return {}
-        html = r.text
+        data = json.loads(stdout.decode())
+    except asyncio.TimeoutError:
+        logger.warning(f"yt-dlp 超时: {channel_url}")
+        return {}
     except Exception as e:
-        logger.warning(f"about 页面请求异常: {e}")
+        logger.warning(f"yt-dlp 异常: {e}")
         return {}
 
-    # YouTube 把外链放在 ytInitialData 的 channelExternalLinkViewModel 里，
-    # 其中 link.commandRuns[].onTap.innertubeCommand.urlEndpoint.url 是 YouTube 重定向 URL，
-    # 格式形如 https://www.youtube.com/redirect?...&q=https%3A%2F%2Finstagram.com%2Fxxx
-    # 直接从 HTML 文本中提取 q= 参数里的真实 URL 即可。
-    real_urls: list[str] = []
+    # 优先用 links 字段（yt-dlp 2024+ 直接解析好的外链列表）
+    links_field = data.get("links") or []
+    if links_field:
+        explicit_urls = " ".join(lk.get("url", "") for lk in links_field)
+        result = parse_social_links(explicit_urls)
+        if result:
+            logger.info(f"yt-dlp links 字段找到: {result}")
+            return result
 
-    # 方式1：从 redirect URL 的 q= 参数中提取真实目标
-    for encoded in re.findall(r'"url":"https://www\.youtube\.com/redirect\?[^"]*?q=([^&"\\]+)', html):
-        try:
-            from urllib.parse import unquote
-            real_urls.append(unquote(encoded))
-        except Exception:
-            pass
-
-    # 方式2：直接出现的外链（有些频道直接暴露明文）
-    direct = re.findall(
-        r'"(https?://(?:(?!youtube\.com|youtu\.be|yt\.be|google\.com)[^"\\]{8,}))"',
-        html,
-    )
-    real_urls.extend(direct)
-
-    combined = " ".join(real_urls)
+    # 降级：从 description + tags 里正则搜索
+    combined = data.get("description", "") + " " + " ".join(data.get("tags") or [])
     return parse_social_links(combined)
-
+  
 # ══════════════════════════════════════════════════════════════
 #  飞书 API
 # ══════════════════════════════════════════════════════════════
