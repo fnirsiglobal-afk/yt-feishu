@@ -10,7 +10,6 @@ import re
 import asyncio
 import logging
 from datetime import datetime, timezone
-import json
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -19,7 +18,6 @@ from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# ── 日志 ────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -27,25 +25,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── 环境变量 ────────────────────────────────────────────────
 YT_API_KEY        = os.environ["YT_API_KEY"]
 FEISHU_APP_ID     = os.environ["FEISHU_APP_ID"]
 FEISHU_APP_SECRET = os.environ["FEISHU_APP_SECRET"]
-BITABLE_APP_TOKEN = os.environ["BITABLE_APP_TOKEN"]   # /base/ 后面的字符串
-BITABLE_TABLE_ID  = os.environ["BITABLE_TABLE_ID"]    # tbl 开头
+BITABLE_APP_TOKEN = os.environ["BITABLE_APP_TOKEN"]
+BITABLE_TABLE_ID  = os.environ["BITABLE_TABLE_ID"]
 
-# 定时任务 Cron 表达式，默认每天早上 9:00（Asia/Shanghai）
-# 格式：分 时 日 月 周，例如 "0 9 * * *" = 每天9点
-# 如需每6小时："0 */6 * * *"  如需每小时："0 * * * *"
 SCHEDULE_CRON = os.getenv("SCHEDULE_CRON", "0 9 * * *")
 SCHEDULE_TZ   = os.getenv("SCHEDULE_TZ", "Asia/Shanghai")
 
 YT_BASE = "https://www.googleapis.com/youtube/v3"
-# 企业专属域名版飞书需要改成对应域名，例如 https://open.qseatj2kzm.feishu.cn/open-apis
-# 标准版保持 https://open.feishu.cn/open-apis
-FS_BASE = os.getenv("FEISHU_API_BASE", "https://open.feishu.cn") + "/open-apis"
+FS_BASE = "https://open.feishu.cn/open-apis"
 
-# 定时任务运行中防重入锁
 _refresh_lock = asyncio.Lock()
 
 
@@ -54,7 +45,6 @@ _refresh_lock = asyncio.Lock()
 # ══════════════════════════════════════════════════════════════
 
 def extract_channel_identifier(url: str):
-    """从频道 URL 中提取类型和标识符"""
     url = url.strip()
     patterns = [
         ("id",     r"youtube\.com/channel/(UC[\w-]+)"),
@@ -74,12 +64,11 @@ def extract_channel_identifier(url: str):
 
 
 def parse_social_links(description: str) -> dict:
-    """从简介文本中提取各平台完整链接"""
     rules = {
-        "INS": (r"instagram\.com/([\w.]+)",        "https://instagram.com/"),
+        "INS": (r"instagram\.com/([\w.]+)",         "https://instagram.com/"),
         "X":   (r"(?:twitter\.com|x\.com)/([\w]+)", "https://x.com/"),
-        "FB":  (r"facebook\.com/([\w.]+)",          "https://facebook.com/"),
-        "TK":  (r"tiktok\.com/@?([\w.]+)",          "https://tiktok.com/@"),
+        "FB":  (r"facebook\.com/([\w.]+)",           "https://facebook.com/"),
+        "TK":  (r"tiktok\.com/@?([\w.]+)",           "https://tiktok.com/@"),
     }
     result = {}
     for platform, (pat, prefix) in rules.items():
@@ -90,7 +79,6 @@ def parse_social_links(description: str) -> dict:
 
 
 def hyperlink(url: str, text: str = None):
-    """飞书超链接字段格式"""
     if not url:
         return None
     return {"text": text or url, "link": url}
@@ -102,7 +90,6 @@ def parse_email(description: str):
 
 
 def fmt_date(iso: str):
-    """ISO8601 → 毫秒时间戳（飞书日期字段要求）"""
     if not iso:
         return None
     try:
@@ -113,7 +100,6 @@ def fmt_date(iso: str):
 
 
 def now_ts() -> int:
-    """当前 UTC 时间毫秒时间戳"""
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
@@ -142,7 +128,6 @@ async def resolve_channel(client: httpx.AsyncClient, kind: str, value: str) -> d
             raise RuntimeError("YouTube 搜索未找到该频道")
         cid = items[0]["snippet"]["channelId"]
         d = await yt_get(client, f"channels?part=snippet,statistics,contentDetails&id={cid}")
-
     items = d.get("items", [])
     if not items:
         raise RuntimeError("未找到频道，请确认链接格式")
@@ -168,11 +153,10 @@ async def get_latest_videos(client: httpx.AsyncClient, channel: dict, max_count=
 
 
 # ══════════════════════════════════════════════════════════════
-#  核心：从频道 URL 抓取所有数据，组装飞书字段
+#  核心：组装飞书字段
 # ══════════════════════════════════════════════════════════════
 
 async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> dict:
-    """抓取 YouTube 数据，返回可直接写入飞书的 fields 字典"""
     kind, value = extract_channel_identifier(channel_url)
     if not kind:
         raise RuntimeError(f"无法识别频道链接格式: {channel_url}")
@@ -194,7 +178,7 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
     email  = parse_email(description)
 
     fields = {
-        "频道链接":         hyperlink(channel_url.strip(), channel_url.strip()),
+        "频道链接":         hyperlink(channel_url.strip()),
         "频道名称":         snippet.get("title", ""),
         "国家/地区":        snippet.get("country", ""),
         "邮箱":             {"text": email, "link": f"mailto:{email}"} if email else None,
@@ -211,7 +195,6 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
         "TK":               hyperlink(social.get("TK")),
         "最后更新时间":     now_ts(),
     }
-    # 过滤 None，避免飞书报错
     return {k: v for k, v in fields.items() if v is not None}
 
 
@@ -234,6 +217,7 @@ async def get_feishu_token(client: httpx.AsyncClient) -> str:
 
 async def update_record(client: httpx.AsyncClient, token: str,
                         record_id: str, fields: dict):
+    # 飞书企业版使用 PUT 更新单条记录
     url = (f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}"
            f"/tables/{BITABLE_TABLE_ID}/records/{record_id}")
     r = await client.put(
@@ -242,7 +226,6 @@ async def update_record(client: httpx.AsyncClient, token: str,
         json={"fields": fields},
         timeout=20,
     )
-    # 飞书在 404/50x 时可能返回非 JSON，需安全解析
     try:
         data = r.json()
     except Exception:
@@ -253,21 +236,12 @@ async def update_record(client: httpx.AsyncClient, token: str,
 
 
 async def list_all_records(client: httpx.AsyncClient, token: str) -> list:
-    """
-    拉取多维表格全部记录（自动翻页）。
-    只返回「频道链接」字段有值的行。
-    """
     records = []
     page_token = None
-
     while True:
-        params = {
-            "page_size": 100,
-            "field_names": '["频道链接"]',   # 只拉需要的字段，节省流量
-        }
+        params = {"page_size": 100, "field_names": '["频道链接"]'}
         if page_token:
             params["page_token"] = page_token
-
         url = (f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}"
                f"/tables/{BITABLE_TABLE_ID}/records")
         r = await client.get(
@@ -279,11 +253,9 @@ async def list_all_records(client: httpx.AsyncClient, token: str) -> list:
         data = r.json()
         if data.get("code") != 0:
             raise RuntimeError(f"飞书拉取记录失败: {data.get('msg')}")
-
         items = data.get("data", {}).get("items", [])
         for item in items:
             url_field = item.get("fields", {}).get("频道链接")
-            # 超链接字段值是 {"text":..., "link":...} 或字符串
             if isinstance(url_field, dict):
                 ch_url = url_field.get("link", "") or url_field.get("text", "")
             elif isinstance(url_field, str):
@@ -292,56 +264,42 @@ async def list_all_records(client: httpx.AsyncClient, token: str) -> list:
                 ch_url = ""
             if ch_url.strip():
                 records.append({"record_id": item["record_id"], "channel_url": ch_url.strip()})
-
         has_more   = data.get("data", {}).get("has_more", False)
         page_token = data.get("data", {}).get("page_token")
         if not has_more:
             break
-
     return records
 
 
 # ══════════════════════════════════════════════════════════════
-#  定时任务：刷新全表
+#  定时任务
 # ══════════════════════════════════════════════════════════════
 
 async def refresh_all_records():
-    """
-    定时任务主体：
-    1. 拉取飞书表格全部有「频道链接」的记录
-    2. 逐条查询 YouTube 数据
-    3. 写回飞书（顺序执行，避免 API 被限速）
-    """
     if _refresh_lock.locked():
         logger.warning("定时任务：上一轮仍在执行，跳过本次")
         return
-
     async with _refresh_lock:
         logger.info("═══ 定时刷新任务开始 ═══")
         start = datetime.now()
-
         async with httpx.AsyncClient() as client:
             try:
                 token = await get_feishu_token(client)
             except Exception as e:
                 logger.error(f"定时任务：飞书鉴权失败 → {e}")
                 return
-
             try:
                 records = await list_all_records(client, token)
             except Exception as e:
                 logger.error(f"定时任务：拉取记录失败 → {e}")
                 return
-
             logger.info(f"定时任务：共找到 {len(records)} 条有效记录，开始逐条刷新")
-
             ok_count = fail_count = 0
             for i, rec in enumerate(records, 1):
                 rid = rec["record_id"]
                 url = rec["channel_url"]
                 try:
                     fields = await fetch_channel_fields(client, url)
-                    # 刷新时 token 可能已过期（有效期 2 小时），定期续签
                     if i % 50 == 0:
                         token = await get_feishu_token(client)
                     await update_record(client, token, rid, fields)
@@ -350,16 +308,13 @@ async def refresh_all_records():
                 except Exception as e:
                     logger.error(f"  [{i}/{len(records)}] ✗ {url} → {e}")
                     fail_count += 1
-
-                # 每条之间短暂等待，避免触发 YouTube API 配额限制
                 await asyncio.sleep(0.5)
-
         elapsed = (datetime.now() - start).seconds
         logger.info(f"═══ 定时刷新完成：成功 {ok_count} / 失败 {fail_count} / 耗时 {elapsed}s ═══")
 
 
 # ══════════════════════════════════════════════════════════════
-#  FastAPI 应用 & 生命周期
+#  FastAPI 应用
 # ══════════════════════════════════════════════════════════════
 
 scheduler = AsyncIOScheduler(timezone=SCHEDULE_TZ)
@@ -367,33 +322,24 @@ scheduler = AsyncIOScheduler(timezone=SCHEDULE_TZ)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 解析 Cron 表达式并注册定时任务
     cron_parts = SCHEDULE_CRON.strip().split()
     if len(cron_parts) != 5:
-        logger.error(f"SCHEDULE_CRON 格式错误（需5段）：{SCHEDULE_CRON}，定时任务不会启动")
+        logger.error(f"SCHEDULE_CRON 格式错误：{SCHEDULE_CRON}")
     else:
         minute, hour, day, month, dow = cron_parts
         scheduler.add_job(
             refresh_all_records,
-            CronTrigger(
-                minute=minute, hour=hour,
-                day=day, month=month, day_of_week=dow,
-                timezone=SCHEDULE_TZ,
-            ),
-            id="refresh_all",
-            replace_existing=True,
-            misfire_grace_time=300,   # 允许最多 5 分钟的错过容忍
+            CronTrigger(minute=minute, hour=hour, day=day,
+                        month=month, day_of_week=dow, timezone=SCHEDULE_TZ),
+            id="refresh_all", replace_existing=True, misfire_grace_time=300,
         )
         scheduler.start()
         logger.info(f"✅ 定时任务已启动：Cron={SCHEDULE_CRON}  TZ={SCHEDULE_TZ}")
-
-    yield   # ← 应用运行期间
-
+    yield
     scheduler.shutdown(wait=False)
-    logger.info("定时任务已关闭")
 
 
-app = FastAPI(title="YouTube → 飞书多维表格（含定时刷新）", lifespan=lifespan)
+app = FastAPI(title="YouTube → 飞书多维表格", lifespan=lifespan)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -402,20 +348,13 @@ app = FastAPI(title="YouTube → 飞书多维表格（含定时刷新）", lifes
 
 @app.post("/webhook/youtube")
 async def webhook_youtube(request: Request):
-    """
-    飞书按钮触发 Webhook。
-    飞书 POST 的 JSON 格式：
-      { "record_id": "recXXXXXX", "channel_url": "https://..." }
-    """
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(400, "请求体必须是 JSON")
 
     record_id = (body.get("record_id") or "").strip()
-
-    # channel_url 可能是纯字符串，也可能是飞书超链接对象 {"text":..., "link":...}
-    raw_url = body.get("channel_url") or ""
+    raw_url   = body.get("channel_url") or ""
     if isinstance(raw_url, dict):
         channel_url = (raw_url.get("link") or raw_url.get("text") or "").strip()
     else:
@@ -424,10 +363,9 @@ async def webhook_youtube(request: Request):
     if not record_id:
         raise HTTPException(400, "缺少 record_id")
     if not channel_url:
-        raise HTTPException(400, "缺少 channel_url（频道链接字段为空）")
+        raise HTTPException(400, "缺少 channel_url")
 
     logger.info(f"Webhook 触发：record={record_id}  url={channel_url}")
-
     try:
         async with httpx.AsyncClient() as client:
             fields   = await fetch_channel_fields(client, channel_url)
@@ -442,27 +380,18 @@ async def webhook_youtube(request: Request):
 
 @app.post("/admin/refresh-now")
 async def trigger_refresh_now():
-    """
-    手动触发一次全表刷新（无需等待定时）。
-    调用方式：POST https://你的域名/admin/refresh-now
-    """
     if _refresh_lock.locked():
         return JSONResponse({"code": 1, "msg": "上一轮刷新仍在执行中，请稍后再试"})
-    # 后台异步执行，不阻塞响应
     asyncio.create_task(refresh_all_records())
     return JSONResponse({"code": 0, "msg": "全表刷新任务已在后台启动"})
 
 
 @app.get("/admin/status")
 async def status():
-    """查看定时任务状态和下次执行时间"""
     jobs = []
     for job in scheduler.get_jobs():
         next_run = job.next_run_time
-        jobs.append({
-            "id":       job.id,
-            "next_run": next_run.isoformat() if next_run else None,
-        })
+        jobs.append({"id": job.id, "next_run": next_run.isoformat() if next_run else None})
     return JSONResponse({
         "scheduler_running": scheduler.running,
         "cron":              SCHEDULE_CRON,
@@ -470,210 +399,6 @@ async def status():
         "jobs":              jobs,
         "refresh_running":   _refresh_lock.locked(),
     })
-
-
-@app.get("/admin/deep-patch/{record_id}")
-async def deep_patch(record_id: str):
-    """同时测试标准域名和企业专属域名"""
-    async with httpx.AsyncClient(follow_redirects=False) as client:
-        token = await get_feishu_token(client)
-        results = {}
-
-        for label, base in [
-            ("standard",  "https://open.feishu.cn/open-apis"),
-            ("custom",    "https://open.qseatj2kzm.feishu.cn/open-apis"),
-        ]:
-            url = f"{base}/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{BITABLE_TABLE_ID}/records/{record_id}"
-            try:
-                r = await client.patch(
-                    url,
-                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                    json={"fields": {"频道名称": "test123"}},
-                    timeout=15,
-                )
-                results[label] = {"status": r.status_code, "url": url, "body": r.text[:300]}
-            except Exception as e:
-                results[label] = {"error": str(e), "url": url}
-
-        return JSONResponse({"token_start": token[:15], "results": results})
-
-
-@app.get("/admin/list-fields")
-async def list_fields():
-    """列出副本表所有字段名和类型"""
-    async with httpx.AsyncClient() as client:
-        token = await get_feishu_token(client)
-        url = f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{BITABLE_TABLE_ID}/fields"
-        r = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        try:
-            data = r.json()
-        except Exception:
-            return JSONResponse({"status": r.status_code, "body": r.text[:300]})
-        fields = [
-            {"name": f.get("field_name"), "type": f.get("type"), "id": f.get("field_id")}
-            for f in data.get("data", {}).get("items", [])
-        ]
-        return JSONResponse({"status": r.status_code, "fields": fields})
-
-
-@app.get("/admin/patch-test/{record_id}")
-async def patch_test(record_id: str):
-    """最简单的 PATCH 测试，逐步缩小问题范围"""
-    async with httpx.AsyncClient() as client:
-        token = await get_feishu_token(client)
-        
-        tests = {}
-        
-        # 测试1：PATCH 副本表的这条记录（当前配置，不显式设置 Content-Type）
-        url1 = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{BITABLE_TABLE_ID}/records/{record_id}"
-        r1 = await client.patch(url1, headers={"Authorization": f"Bearer {token}"}, json={"fields": {"频道名称": "test"}}, timeout=15)
-        tests["patch_current"] = {"url": url1, "status": r1.status_code, "body": r1.text[:200]}
-
-        # 测试1b：同样的 URL，显式加 Content-Type: application/json
-        r1b = await client.patch(
-            url1,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            content=json.dumps({"fields": {"频道名称": "test"}}).encode("utf-8"),
-            timeout=15,
-        )
-        tests["patch_explicit_content_type"] = {"url": url1, "status": r1b.status_code, "body": r1b.text[:200]}
-
-        # 测试1c：用 GET 同样的客户端连接对象，紧接着发 PATCH（排除连接池/keep-alive 问题）
-        r1c_get = await client.get(url1, headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        r1c = await client.patch(
-            url1,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            content=json.dumps({"fields": {"频道名称": "test"}}).encode("utf-8"),
-            timeout=15,
-        )
-        tests["get_then_patch_same_client"] = {
-            "get_status": r1c_get.status_code,
-            "patch_status": r1c.status_code,
-            "patch_body": r1c.text[:200],
-        }
-
-        # 测试2：PATCH 原表（tblzlTKTH8z2R16P）第一条记录
-        url2 = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/tblzlTKTH8z2R16P/records/{record_id}"
-        r2 = await client.patch(url2, headers={"Authorization": f"Bearer {token}"}, json={"fields": {"频道名称": "test"}}, timeout=15)
-        tests["patch_original_table"] = {"url": url2, "status": r2.status_code, "body": r2.text[:200]}
-
-        # 测试3：GET 副本表单条记录（直接按 record_id 读）
-        url3 = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{BITABLE_TABLE_ID}/records/{record_id}"
-        r3 = await client.get(url3, headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        tests["get_single_record"] = {"status": r3.status_code, "body": r3.text[:200]}
-
-        return JSONResponse(tests)
-
-
-@app.get("/admin/list-apps")
-async def list_apps():
-    """列出应用有权访问的多维表格，验证 app_token 是否正确"""
-    async with httpx.AsyncClient() as client:
-        token = await get_feishu_token(client)
-        
-        # 直接用 app_token 查询表格元信息
-        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}"
-        r = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
-        )
-        try:
-            data = r.json()
-        except Exception:
-            data = r.text[:300]
-        
-        # 同时查询表格列表
-        url2 = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables"
-        r2 = await client.get(
-            url2,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
-        )
-        try:
-            data2 = r2.json()
-        except Exception:
-            data2 = r2.text[:300]
-
-        return JSONResponse({
-            "app_token": BITABLE_APP_TOKEN,
-            "get_app_info": {"status": r.status_code, "response": data},
-            "list_tables": {"status": r2.status_code, "response": data2},
-        })
-
-
-@app.get("/admin/test-write/{record_id}")
-async def test_write(record_id: str):
-    """测试对指定 record_id 的写入权限，返回完整调试信息"""
-    async with httpx.AsyncClient() as client:
-        token = await get_feishu_token(client)
-        
-        # 同时测试两个可能的 API 域名
-        results = {}
-        for domain in ["https://open.feishu.cn", "https://open.larksuite.com"]:
-            url = (f"{domain}/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}"
-                   f"/tables/{BITABLE_TABLE_ID}/records/{record_id}")
-            try:
-                r = await client.patch(
-                    url,
-                    headers={"Authorization": f"Bearer {token}"},
-                    json={"fields": {"频道名称": "写入测试-可删除"}},
-                    timeout=15,
-                )
-                try:
-                    data = r.json()
-                except Exception:
-                    data = r.text[:300]
-                results[domain] = {"http_status": r.status_code, "response": data}
-            except Exception as e:
-                results[domain] = {"error": str(e)}
-        
-        # 也测试读取用的 URL 格式（不带 record_id）
-        read_url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}"
-                    f"/tables/{BITABLE_TABLE_ID}/records?page_size=1")
-        r2 = await client.get(read_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        results["read_check"] = {"http_status": r2.status_code, "url": read_url}
-        
-        return JSONResponse({
-            "token_prefix": token[:20] + "...",
-            "bitable_app_token": BITABLE_APP_TOKEN,
-            "table_id": BITABLE_TABLE_ID,
-            "record_id": record_id,
-            "results": results,
-        })
-
-
-@app.get("/admin/debug-records")
-async def debug_records():
-    """列出表格前5条记录的真实 record_id，用于排查"""
-    async with httpx.AsyncClient() as client:
-        token = await get_feishu_token(client)
-        url = (f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}"
-               f"/tables/{BITABLE_TABLE_ID}/records?page_size=5")
-        r = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
-        )
-        try:
-            data = r.json()
-        except Exception:
-            return JSONResponse({"error": f"HTTP {r.status_code}", "body": r.text[:500]})
-        
-        if data.get("code") != 0:
-            return JSONResponse({"feishu_error": data})
-        
-        items = data.get("data", {}).get("items", [])
-        result = []
-        for item in items:
-            result.append({
-                "record_id": item.get("record_id"),
-                "频道链接": item.get("fields", {}).get("频道链接"),
-            })
-        return JSONResponse({"records": result, "total": len(result)})
 
 
 @app.get("/health")
