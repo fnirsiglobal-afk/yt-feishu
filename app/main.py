@@ -459,6 +459,46 @@ async def status():
     })
 
 
+@app.get("/admin/debug-links")
+async def debug_links(url: str = "https://www.youtube.com/@bookledge"):
+    """调试：分析 YouTube 频道页面里社媒链接的存储位置"""
+    import json as jsonlib
+    async with httpx.AsyncClient() as client:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        r = await client.get(url.rstrip("/") + "/about", headers=headers, timeout=15, follow_redirects=True)
+        html = r.text
+
+        results = {"html_len": len(html), "found": {}}
+
+        # 搜索关键词直接在 HTML
+        for kw in ["instagram", "facebook", "tiktok", "twitter", "bookl3dge", "goodnews"]:
+            if kw.lower() in html.lower():
+                idx = html.lower().find(kw.lower())
+                results["found"][kw] = html[max(0, idx-80):idx+120]
+
+        # 尝试提取 ytInitialData
+        m = re.search(r'var ytInitialData\s*=\s*(\{.{100,}?\});\s*(?:var |</script>)', html, re.DOTALL)
+        if m:
+            results["ytInitialData_found"] = True
+            try:
+                data = jsonlib.loads(m.group(1))
+                raw = jsonlib.dumps(data, ensure_ascii=False)
+                results["ytInitialData_len"] = len(raw)
+                for kw in ["instagram", "facebook", "tiktok", "channelExternalLink", "bookl3dge"]:
+                    if kw.lower() in raw.lower():
+                        idx = raw.lower().find(kw.lower())
+                        results["found"]["json_" + kw] = raw[max(0,idx-60):idx+120]
+            except Exception as e:
+                results["ytInitialData_parse_error"] = str(e)
+        else:
+            results["ytInitialData_found"] = False
+
+        return JSONResponse(results)
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
