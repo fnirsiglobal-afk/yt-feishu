@@ -63,9 +63,8 @@ def extract_channel_identifier(url: str):
     return None, None
 
 
-def parse_social_links(description: str, branding_keywords: str = "") -> dict:
-    # 合并简介文本和 brandingSettings keywords 一起搜索
-    combined = description + " " + branding_keywords
+def parse_social_links(text: str) -> dict:
+    combined = text
     rules = {
         "INS": (r"instagram\.com/([\w.]+)",          "https://instagram.com/"),
         "X":   (r"(?:twitter\.com|x\.com)/([\w]+)", "https://x.com/"),
@@ -81,39 +80,29 @@ def parse_social_links(description: str, branding_keywords: str = "") -> dict:
 
 async def fetch_channel_links(client: httpx.AsyncClient, channel_url: str) -> str:
     """
-    抓取 YouTube 频道 about 页面，提取链接卡片区域的所有 URL（含裸域名）。
-    返回拼接成一段文本，供 parse_social_links 搜索。
+    抓取 YouTube 频道 about 页面，从 ytInitialData 里提取 channelExternalLinkViewModel 链接。
+    这些链接是频道「关于」页的链接卡片，YouTube API 不返回此数据。
     """
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        base = channel_url.rstrip("/")
-        r = await client.get(base + "/about", headers=headers, timeout=15, follow_redirects=True)
+        r = await client.get(
+            channel_url.rstrip("/") + "/about",
+            headers=headers, timeout=15, follow_redirects=True
+        )
         html = r.text
 
-        collected = []
-
-        # 方式1：提取 JSON 数据里的完整 URL（带 https://）
-        urls = re.findall(r'"url"\s*:\s*"(https?://[^"]+)"', html)
-        external = [
-            u for u in urls
-            if not re.search(r'(youtube\.com|youtu\.be|google\.com|gstatic\.com|ggpht\.com)', u, re.I)
-        ]
-        collected.extend(external)
-
-        # 方式2：提取 JSON 里 text 字段的裸域名链接（bookledge 这类频道用这种格式）
-        # 匹配 "text":"instagram.com/xxx" 或 "text":"facebook.com/xxx"
-        bare = re.findall(
-            r'"text"\s*:\s*"((?:instagram|twitter|x|facebook|tiktok)\.com/[\w.@/-]+)"',
-            html, re.I
+        # 从 channelExternalLinkViewModel 提取 link.content（裸域名或完整URL）
+        links = re.findall(
+            r'"channelExternalLinkViewModel"\s*:\s*\{.*?"link"\s*:\s*\{.*?"content"\s*:\s*"([^"]+)"',
+            html, re.DOTALL
         )
-        collected.extend(bare)
 
-        if collected:
-            logger.info(f"频道页面抓到外链：{collected[:6]}")
-        return " ".join(collected)
+        if links:
+            logger.info(f"频道外链卡片: {links}")
+        return " ".join(links)
     except Exception as e:
         logger.warning(f"抓取频道页面失败（忽略）: {e}")
         return ""
