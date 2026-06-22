@@ -218,7 +218,7 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
 async def fetch_about_page_links(
     client: httpx.AsyncClient, channel_url: str
 ) -> dict:
-    about_url = channel_url.rstrip("/") + "/about"
+    about_url = channel_url.rstrip("/")
     try:
         proc = await asyncio.create_subprocess_exec(
             "yt-dlp",
