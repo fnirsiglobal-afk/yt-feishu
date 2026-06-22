@@ -293,7 +293,6 @@ async def get_feishu_token(client: httpx.AsyncClient) -> str:
 async def update_record(client: httpx.AsyncClient, token: str,
                         record_id: str, fields: dict):
     # 飞书企业版使用 PUT 更新单条记录
-    logger.info(f"飞书写入字段: {fields}")  # 打完整内容而不只是 keys
     url = (f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}"
            f"/tables/{BITABLE_TABLE_ID}/records/{record_id}")
     r = await client.put(
