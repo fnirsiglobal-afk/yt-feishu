@@ -63,20 +63,21 @@ def extract_channel_identifier(url: str):
     return None, None
 
 
-def parse_social_links(description: str) -> dict:
+def parse_social_links(description: str, branding_keywords: str = "") -> dict:
+    # 合并简介文本和 brandingSettings keywords 一起搜索
+    combined = description + " " + branding_keywords
     rules = {
-        "INS": (r"instagram\.com/([\w.]+)",         "https://instagram.com/"),
+        "INS": (r"instagram\.com/([\w.]+)",          "https://instagram.com/"),
         "X":   (r"(?:twitter\.com|x\.com)/([\w]+)", "https://x.com/"),
-        "FB":  (r"facebook\.com/([\w.]+)",           "https://facebook.com/"),
-        "TK":  (r"tiktok\.com/@?([\w.]+)",           "https://tiktok.com/@"),
+        "FB":  (r"facebook\.com/([\w.]+)",            "https://facebook.com/"),
+        "TK":  (r"tiktok\.com/@?([\w.]+)",            "https://tiktok.com/@"),
     }
     result = {}
     for platform, (pat, prefix) in rules.items():
-        m = re.search(pat, description, re.I)
+        m = re.search(pat, combined, re.I)
         if m:
             result[platform] = prefix + m.group(1)
     return result
-
 
 def hyperlink(url: str, text: str = None):
     if not url:
@@ -117,17 +118,18 @@ async def yt_get(client: httpx.AsyncClient, path: str) -> dict:
 
 
 async def resolve_channel(client: httpx.AsyncClient, kind: str, value: str) -> dict:
+    parts = "snippet,statistics,contentDetails,brandingSettings"
     if kind == "id":
-        d = await yt_get(client, f"channels?part=snippet,statistics,contentDetails&id={value}")
+        d = await yt_get(client, f"channels?part={parts}&id={value}")
     elif kind == "handle":
-        d = await yt_get(client, f"channels?part=snippet,statistics,contentDetails&forHandle={value}")
+        d = await yt_get(client, f"channels?part={parts}&forHandle={value}")
     else:
         s = await yt_get(client, f"search?part=snippet&type=channel&q={value}&maxResults=1")
         items = s.get("items", [])
         if not items:
             raise RuntimeError("YouTube 搜索未找到该频道")
         cid = items[0]["snippet"]["channelId"]
-        d = await yt_get(client, f"channels?part=snippet,statistics,contentDetails&id={cid}")
+        d = await yt_get(client, f"channels?part={parts}&id={cid}")
     items = d.get("items", [])
     if not items:
         raise RuntimeError("未找到频道，请确认链接格式")
@@ -174,7 +176,11 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
     min_views      = min(views) if views else None
     latest_publish = fmt_date(videos[0]["snippet"].get("publishedAt")) if videos else None
 
-    social = parse_social_links(description)
+    # brandingSettings.channel.keywords 里有时包含社媒链接
+    branding_kw = (channel.get("brandingSettings", {})
+                   .get("channel", {})
+                   .get("keywords", ""))
+    social = parse_social_links(description, branding_kw)
     email  = parse_email(description)
 
     fields = {
