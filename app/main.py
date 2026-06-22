@@ -63,9 +63,8 @@ def extract_channel_identifier(url: str):
     return None, None
 
 
-def parse_social_links(description: str, branding_keywords: str = "") -> dict:
-    # 合并简介文本和 brandingSettings keywords 一起搜索
-    combined = description + " " + branding_keywords
+def parse_social_links(text: str) -> dict:
+    """从任意文本中解析社媒链接（description / brandingSettings / about HTML 均可传入）"""
     rules = {
         "INS": (r"instagram\.com/([\w.]+)",          "https://instagram.com/"),
         "X":   (r"(?:twitter\.com|x\.com)/([\w]+)", "https://x.com/"),
@@ -74,7 +73,7 @@ def parse_social_links(description: str, branding_keywords: str = "") -> dict:
     }
     result = {}
     for platform, (pat, prefix) in rules.items():
-        m = re.search(pat, combined, re.I)
+        m = re.search(pat, text, re.I)
         if m:
             result[platform] = prefix + m.group(1)
     return result
@@ -176,11 +175,23 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
     min_views      = min(views) if views else None
     latest_publish = fmt_date(videos[0]["snippet"].get("publishedAt")) if videos else None
 
-    # brandingSettings.channel.keywords 里有时包含社媒链接
     branding_kw = (channel.get("brandingSettings", {})
                    .get("channel", {})
                    .get("keywords", ""))
-    social = parse_social_links(description, branding_kw)
+
+    # ── 第一步：从 API 数据解析社媒链接 ──────────────────────────────
+    social = parse_social_links(description + " " + branding_kw)
+
+    # ── 第二步：about 页面兜底，补充 API 未找到的平台 ────────────────
+    missing = [p for p in ("INS", "X", "FB", "TK") if p not in social]
+    if missing:
+        logger.info(f"API 未找到 {missing}，尝试 about 页面兜底: {channel_url}")
+        about_social = await fetch_about_page_links(client, channel_url)
+        for platform in missing:
+            if platform in about_social:
+                social[platform] = about_social[platform]
+                logger.info(f"  about 页面补充到 {platform}: {about_social[platform]}")
+
     email  = parse_email(description)
 
     fields = {
@@ -203,6 +214,62 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
     }
     return {k: v for k, v in fields.items() if v is not None}
 
+async def fetch_about_page_links(
+    client: httpx.AsyncClient, channel_url: str
+) -> dict:
+    """
+    爬取 YouTube 频道 about 页面，提取社媒链接。
+    YouTube 将 about 页面的链接数据以 JSON 形式嵌入 window.__data__ 或 ytInitialData 中。
+    此处直接对整段 HTML 文本运行正则，避免解析复杂 JSON。
+    """
+    # 构造 about URL：handle / channel / user 格式均兼容
+    if "/about" not in channel_url:
+        about_url = channel_url.rstrip("/") + "/about"
+    else:
+        about_url = channel_url
+
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        r = await client.get(about_url, headers=headers, timeout=15,
+                              follow_redirects=True)
+        if r.status_code != 200:
+            logger.warning(f"about 页面请求失败 HTTP {r.status_code}: {about_url}")
+            return {}
+        html = r.text
+    except Exception as e:
+        logger.warning(f"about 页面请求异常: {e}")
+        return {}
+
+    # YouTube 把外链放在 ytInitialData 的 channelExternalLinkViewModel 里，
+    # 其中 link.commandRuns[].onTap.innertubeCommand.urlEndpoint.url 是 YouTube 重定向 URL，
+    # 格式形如 https://www.youtube.com/redirect?...&q=https%3A%2F%2Finstagram.com%2Fxxx
+    # 直接从 HTML 文本中提取 q= 参数里的真实 URL 即可。
+    real_urls: list[str] = []
+
+    # 方式1：从 redirect URL 的 q= 参数中提取真实目标
+    for encoded in re.findall(r'"url":"https://www\.youtube\.com/redirect\?[^"]*?q=([^&"\\]+)', html):
+        try:
+            from urllib.parse import unquote
+            real_urls.append(unquote(encoded))
+        except Exception:
+            pass
+
+    # 方式2：直接出现的外链（有些频道直接暴露明文）
+    direct = re.findall(
+        r'"(https?://(?:(?!youtube\.com|youtu\.be|yt\.be|google\.com)[^"\\]{8,}))"',
+        html,
+    )
+    real_urls.extend(direct)
+
+    combined = " ".join(real_urls)
+    return parse_social_links(combined)
 
 # ══════════════════════════════════════════════════════════════
 #  飞书 API
