@@ -446,43 +446,16 @@ async def webhook_youtube(request: Request):
         raise HTTPException(400, "缺少 channel_url")
 
     logger.info(f"Webhook 触发：record={record_id}  url={channel_url}")
+    try:
+        async with httpx.AsyncClient() as client:
+            fields   = await fetch_channel_fields(client, channel_url)
+            fs_token = await get_feishu_token(client)
+            await update_record(client, fs_token, record_id, fields)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
 
-    # 立即返回，后台异步处理
-    async def _process():
-        try:
-            async with httpx.AsyncClient() as client:
-                fields   = await fetch_channel_fields(client, channel_url)
-                fs_token = await get_feishu_token(client)
-                await update_record(client, fs_token, record_id, fields)
-            logger.info(f"Webhook 完成：record={record_id}")
-        except Exception as e:
-            logger.error(f"Webhook 处理失败：record={record_id} → {e}")
-
-    asyncio.create_task(_process())
-    return JSONResponse({"code": 0, "msg": "accepted", "record_id": record_id})
-
-
-@app.post("/admin/refresh-now")
-async def trigger_refresh_now():
-    if _refresh_lock.locked():
-        return JSONResponse({"code": 1, "msg": "上一轮刷新仍在执行中，请稍后再试"})
-    asyncio.create_task(refresh_all_records())
-    return JSONResponse({"code": 0, "msg": "全表刷新任务已在后台启动"})
-
-
-@app.get("/admin/status")
-async def status():
-    jobs = []
-    for job in scheduler.get_jobs():
-        next_run = job.next_run_time
-        jobs.append({"id": job.id, "next_run": next_run.isoformat() if next_run else None})
-    return JSONResponse({
-        "scheduler_running": scheduler.running,
-        "cron":              SCHEDULE_CRON,
-        "timezone":          SCHEDULE_TZ,
-        "jobs":              jobs,
-        "refresh_running":   _refresh_lock.locked(),
-    })
+    logger.info(f"Webhook 完成：record={record_id}")
+    return JSONResponse({"code": 0, "msg": "success", "record_id": record_id})
 
 
 @app.get("/admin/debug-links")
