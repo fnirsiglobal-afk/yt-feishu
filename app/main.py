@@ -1,22 +1,23 @@
 """
 YouTube → 飞书多维表格同步服务
 支持：
-  1. 飞书按钮触发 Webhook（单条写入）
-  2. 定时任务自动刷新全表所有已有数据（周期可在环境变量配置）
+  1. 轮询任务：每隔 POLL_INTERVAL_MINUTES 分钟扫描飞书，满足以下任一条件则刷新：
+       a. 「刷新状态」= 待刷新（飞书按钮手动触发）
+       b. 「最后更新时间」距今超过 REFRESH_DAYS 天（自动到期）
+  2. /webhook/youtube 路由保留（兼容旧流程，但飞书无法直连时不可用）
 """
 
 import os
 import re
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,8 +32,13 @@ FEISHU_APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 BITABLE_APP_TOKEN = os.environ["BITABLE_APP_TOKEN"]
 BITABLE_TABLE_ID  = os.environ["BITABLE_TABLE_ID"]
 
-SCHEDULE_CRON = os.getenv("SCHEDULE_CRON", "0 9 * * *")
-SCHEDULE_TZ   = os.getenv("SCHEDULE_TZ", "Asia/Shanghai")
+SCHEDULE_TZ            = os.getenv("SCHEDULE_TZ", "Asia/Shanghai")
+POLL_INTERVAL_MINUTES  = int(os.getenv("POLL_INTERVAL_MINUTES", "1"))   # 轮询间隔（分钟）
+REFRESH_DAYS           = int(os.getenv("REFRESH_DAYS", "14"))           # 自动到期天数
+
+# 飞书「刷新状态」字段的选项值（需与飞书表格中的单选选项名称完全一致）
+STATUS_PENDING  = "待刷新"   # 按钮触发时飞书写入此值
+STATUS_DONE     = "已完成"   # 刷新完成后写回此值
 
 YT_BASE = "https://www.googleapis.com/youtube/v3"
 FS_BASE = "https://open.feishu.cn/open-apis"
@@ -64,7 +70,6 @@ def extract_channel_identifier(url: str):
 
 
 def parse_social_links(text: str) -> dict:
-    combined = text
     rules = {
         "INS": (r"instagram\.com/([\w.]+)",          "https://instagram.com/"),
         "X":   (r"(?:twitter\.com|x\.com)/([\w]+)", "https://x.com/"),
@@ -73,10 +78,11 @@ def parse_social_links(text: str) -> dict:
     }
     result = {}
     for platform, (pat, prefix) in rules.items():
-        m = re.search(pat, combined, re.I)
+        m = re.search(pat, text, re.I)
         if m:
             result[platform] = prefix + m.group(1)
     return result
+
 
 async def fetch_channel_links(client: httpx.AsyncClient, channel_url: str) -> str:
     """
@@ -93,13 +99,10 @@ async def fetch_channel_links(client: httpx.AsyncClient, channel_url: str) -> st
             headers=headers, timeout=15, follow_redirects=True
         )
         html = r.text
-
-        # 从 channelExternalLinkViewModel 提取 link.content（裸域名或完整URL）
         links = re.findall(
             r'"channelExternalLinkViewModel"\s*:\s*\{.*?"link"\s*:\s*\{.*?"content"\s*:\s*"([^"]+)"',
             html, re.DOTALL
         )
-
         if links:
             logger.info(f"频道外链卡片: {links}")
         return " ".join(links)
@@ -173,8 +176,6 @@ async def get_latest_videos(client: httpx.AsyncClient, channel: dict, max_count=
         return []
 
     shorts_playlist = "UUSH" + uploads[2:]
-
-    # 先拿 Shorts ID 集合
     shorts_ids: set = set()
     try:
         sp = await yt_get(client, f"playlistItems?part=snippet&playlistId={shorts_playlist}&maxResults=50")
@@ -186,7 +187,6 @@ async def get_latest_videos(client: httpx.AsyncClient, channel: dict, max_count=
     except Exception:
         pass
 
-    # 分页拉 uploads，直到凑够 max_count 条普通视频
     regular_ids = []
     page_token = None
 
@@ -194,30 +194,23 @@ async def get_latest_videos(client: httpx.AsyncClient, channel: dict, max_count=
         path = f"playlistItems?part=snippet&playlistId={uploads}&maxResults=50"
         if page_token:
             path += f"&pageToken={page_token}"
-
         pl = await yt_get(client, path)
         items = pl.get("items", [])
-
         for i in items:
             vid = (i.get("snippet", {}).get("resourceId", {}).get("videoId"))
             if vid and vid not in shorts_ids:
                 regular_ids.append(vid)
                 if len(regular_ids) >= max_count:
                     break
-
         page_token = pl.get("nextPageToken")
         if not page_token or not items:
-            break  # 没有更多页了，频道普通视频本身不足6条
+            break
 
     if not regular_ids:
         return []
 
     vd = await yt_get(client, f"videos?part=snippet,statistics&id={','.join(regular_ids[:max_count])}")
     return vd.get("items", [])
-
-# ══════════════════════════════════════════════════════════════
-#  抓取频道 About 页面的链接卡片（API 不返回这部分）
-# ══════════════════════════════════════════════════════════════
 
 
 # ══════════════════════════════════════════════════════════════
@@ -242,33 +235,33 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
     min_views      = min(views) if views else None
     latest_publish = fmt_date(videos[0]["snippet"].get("publishedAt")) if videos else None
 
-    # brandingSettings keywords
     branding_kw = (channel.get("brandingSettings", {})
                    .get("channel", {})
                    .get("keywords", ""))
-    # 抓取频道页面链接卡片（补充 API 拿不到的社媒链接）
     page_links = await fetch_channel_links(client, channel_url)
-    # 合并所有来源一起搜索
     social = parse_social_links(description + " " + branding_kw + " " + page_links)
     email  = parse_email(description + " " + page_links)
 
     fields = {
-        "频道链接":         hyperlink(channel_url.strip()),
-        "频道名称":         snippet.get("title", ""),
-        "国家/地区":        snippet.get("country", "") or "/",
-        "邮箱":             {"text": email, "link": f"mailto:{email}"} if email else None,
-        "订阅量":           int(stats["subscriberCount"])
-                            if not stats.get("hiddenSubscriberCount") and stats.get("subscriberCount")
-                            else None,
-        "最新发布时间": latest_publish,
-        "近6条均播":        avg_views,
-        "近6条最高播":      max_views,
-        "近6条最低播":      min_views,
-        "INS":              hyperlink(social.get("INS")) or {"text": "/", "link": ""},  # 无数据填 /
-        "X":                hyperlink(social.get("X")) or {"text": "/", "link": ""},
-        "FB":               hyperlink(social.get("FB")) or {"text": "/", "link": ""},
-        "TK":               hyperlink(social.get("TK")) or {"text": "/", "link": ""},
-        "最后更新时间":     now_ts(),
+        "频道链接":      hyperlink(channel_url.strip()),
+        "频道名称":      snippet.get("title", ""),
+        "国家/地区":     snippet.get("country", "") or "/",
+        "邮箱":          {"text": email, "link": f"mailto:{email}"} if email else None,
+        "订阅量":        int(stats["subscriberCount"])
+                         if not stats.get("hiddenSubscriberCount") and stats.get("subscriberCount")
+                         else None,
+        "最新发布时间":  latest_publish,
+        "近6条均播":     avg_views,
+        "近6条最高播":   max_views,
+        "近6条最低播":   min_views,
+        # ✅ 修复：无社媒链接时不写入该字段，避免空 link 导致飞书静默丢弃整条记录
+        "INS":           hyperlink(social.get("INS")),
+        "X":             hyperlink(social.get("X")),
+        "FB":            hyperlink(social.get("FB")),
+        "TK":            hyperlink(social.get("TK")),
+        "最后更新时间":  now_ts(),
+        # 刷新完成后把状态写回「已完成」
+        "刷新状态":      STATUS_DONE,
     }
     return {k: v for k, v in fields.items() if v is not None}
 
@@ -292,7 +285,6 @@ async def get_feishu_token(client: httpx.AsyncClient) -> str:
 
 async def update_record(client: httpx.AsyncClient, token: str,
                         record_id: str, fields: dict):
-    # 飞书企业版使用 PUT 更新单条记录
     url = (f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}"
            f"/tables/{BITABLE_TABLE_ID}/records/{record_id}")
     r = await client.put(
@@ -301,11 +293,9 @@ async def update_record(client: httpx.AsyncClient, token: str,
         json={"fields": fields},
         timeout=20,
     )
-    # HTTP 200 即视为成功，兼容飞书企业版返回格式差异
     if r.status_code == 200:
         logger.info(f"飞书写入成功 record={record_id}")
         return {"code": 0}
-    # 非 200 才报错
     try:
         data = r.json()
         msg = data.get("msg", r.text[:200])
@@ -315,10 +305,14 @@ async def update_record(client: httpx.AsyncClient, token: str,
 
 
 async def list_all_records(client: httpx.AsyncClient, token: str) -> list:
+    """
+    拉取所有记录，返回字段：record_id、channel_url、status、last_updated_ts
+    """
     records = []
     page_token = None
+    field_names = '["频道链接","刷新状态","最后更新时间"]'
     while True:
-        params = {"page_size": 100, "field_names": '["频道链接"]'}
+        params = {"page_size": 100, "field_names": field_names}
         if page_token:
             params["page_token"] = page_token
         url = (f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}"
@@ -334,15 +328,36 @@ async def list_all_records(client: httpx.AsyncClient, token: str) -> list:
             raise RuntimeError(f"飞书拉取记录失败: {data.get('msg')}")
         items = data.get("data", {}).get("items", [])
         for item in items:
-            url_field = item.get("fields", {}).get("频道链接")
+            fields = item.get("fields", {})
+
+            # 解析频道链接
+            url_field = fields.get("频道链接")
             if isinstance(url_field, dict):
                 ch_url = url_field.get("link", "") or url_field.get("text", "")
             elif isinstance(url_field, str):
                 ch_url = url_field
             else:
                 ch_url = ""
-            if ch_url.strip():
-                records.append({"record_id": item["record_id"], "channel_url": ch_url.strip()})
+            if not ch_url.strip():
+                continue
+
+            # 解析刷新状态（单选字段飞书返回字符串）
+            status_field = fields.get("刷新状态")
+            if isinstance(status_field, dict):
+                status = status_field.get("text", "") or status_field.get("value", "")
+            else:
+                status = status_field or ""
+
+            # 解析最后更新时间（时间戳字段，毫秒）
+            last_updated_ts = fields.get("最后更新时间")  # 可能是 int 或 None
+
+            records.append({
+                "record_id":      item["record_id"],
+                "channel_url":    ch_url.strip(),
+                "status":         str(status).strip(),
+                "last_updated_ts": int(last_updated_ts) if last_updated_ts else None,
+            })
+
         has_more   = data.get("data", {}).get("has_more", False)
         page_token = data.get("data", {}).get("page_token")
         if not has_more:
@@ -351,45 +366,75 @@ async def list_all_records(client: httpx.AsyncClient, token: str) -> list:
 
 
 # ══════════════════════════════════════════════════════════════
-#  定时任务
+#  轮询任务（替代原定时全量刷新 + 支持按钮触发 + 支持自动到期）
 # ══════════════════════════════════════════════════════════════
 
-async def refresh_all_records():
+async def poll_and_refresh():
+    """
+    每隔 POLL_INTERVAL_MINUTES 分钟执行一次，刷新满足以下任一条件的记录：
+      1. 「刷新状态」= 待刷新（飞书按钮手动触发）
+      2. 「最后更新时间」距今超过 REFRESH_DAYS 天（自动到期）
+    """
     if _refresh_lock.locked():
-        logger.warning("定时任务：上一轮仍在执行，跳过本次")
+        logger.warning("轮询：上一轮仍在执行，跳过本次")
         return
+
     async with _refresh_lock:
-        logger.info("═══ 定时刷新任务开始 ═══")
-        start = datetime.now()
+        now = datetime.now(timezone.utc)
+        expire_threshold_ts = int((now - timedelta(days=REFRESH_DAYS)).timestamp() * 1000)
+
         async with httpx.AsyncClient() as client:
             try:
                 token = await get_feishu_token(client)
             except Exception as e:
-                logger.error(f"定时任务：飞书鉴权失败 → {e}")
+                logger.error(f"轮询：飞书鉴权失败 → {e}")
                 return
             try:
                 records = await list_all_records(client, token)
             except Exception as e:
-                logger.error(f"定时任务：拉取记录失败 → {e}")
+                logger.error(f"轮询：拉取记录失败 → {e}")
                 return
-            logger.info(f"定时任务：共找到 {len(records)} 条有效记录，开始逐条刷新")
+
+            # 筛选需要刷新的记录
+            to_refresh = []
+            for rec in records:
+                is_pending = rec["status"] == STATUS_PENDING
+                is_expired = (
+                    rec["last_updated_ts"] is None or
+                    rec["last_updated_ts"] < expire_threshold_ts
+                )
+                if is_pending or is_expired:
+                    reason = []
+                    if is_pending:
+                        reason.append("手动触发")
+                    if is_expired:
+                        reason.append(f"超过{REFRESH_DAYS}天未更新")
+                    to_refresh.append((rec, "+".join(reason)))
+
+            if not to_refresh:
+                logger.info(f"轮询：无需刷新的记录（共扫描 {len(records)} 条）")
+                return
+
+            logger.info(f"轮询：共 {len(to_refresh)} 条需要刷新，开始处理")
             ok_count = fail_count = 0
-            for i, rec in enumerate(records, 1):
+
+            for i, (rec, reason) in enumerate(to_refresh, 1):
                 rid = rec["record_id"]
                 url = rec["channel_url"]
                 try:
                     fields = await fetch_channel_fields(client, url)
+                    # 每50条刷新一次 token
                     if i % 50 == 0:
                         token = await get_feishu_token(client)
                     await update_record(client, token, rid, fields)
-                    logger.info(f"  [{i}/{len(records)}] ✓ {url}")
+                    logger.info(f"  [{i}/{len(to_refresh)}] ✓ {url}（{reason}）")
                     ok_count += 1
                 except Exception as e:
-                    logger.error(f"  [{i}/{len(records)}] ✗ {url} → {e}")
+                    logger.error(f"  [{i}/{len(to_refresh)}] ✗ {url} → {e}")
                     fail_count += 1
                 await asyncio.sleep(0.5)
-        elapsed = (datetime.now() - start).seconds
-        logger.info(f"═══ 定时刷新完成：成功 {ok_count} / 失败 {fail_count} / 耗时 {elapsed}s ═══")
+
+            logger.info(f"轮询完成：成功 {ok_count} / 失败 {fail_count}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -401,19 +446,16 @@ scheduler = AsyncIOScheduler(timezone=SCHEDULE_TZ)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cron_parts = SCHEDULE_CRON.strip().split()
-    if len(cron_parts) != 5:
-        logger.error(f"SCHEDULE_CRON 格式错误：{SCHEDULE_CRON}")
-    else:
-        minute, hour, day, month, dow = cron_parts
-        scheduler.add_job(
-            refresh_all_records,
-            CronTrigger(minute=minute, hour=hour, day=day,
-                        month=month, day_of_week=dow, timezone=SCHEDULE_TZ),
-            id="refresh_all", replace_existing=True, misfire_grace_time=300,
-        )
-        scheduler.start()
-        logger.info(f"✅ 定时任务已启动：Cron={SCHEDULE_CRON}  TZ={SCHEDULE_TZ}")
+    scheduler.add_job(
+        poll_and_refresh,
+        "interval",
+        minutes=POLL_INTERVAL_MINUTES,
+        id="poll_refresh",
+        replace_existing=True,
+        misfire_grace_time=60,
+    )
+    scheduler.start()
+    logger.info(f"✅ 轮询任务已启动：每 {POLL_INTERVAL_MINUTES} 分钟执行一次，自动到期天数={REFRESH_DAYS}")
     yield
     scheduler.shutdown(wait=False)
 
@@ -427,6 +469,7 @@ app = FastAPI(title="YouTube → 飞书多维表格", lifespan=lifespan)
 
 @app.post("/webhook/youtube")
 async def webhook_youtube(request: Request):
+    """保留兼容旧流程，飞书无法直连 Railway 时此路由不可用"""
     try:
         body = await request.json()
     except Exception:
@@ -468,16 +511,11 @@ async def debug_links(url: str = "https://www.youtube.com/@bookledge"):
         }
         r = await client.get(url.rstrip("/") + "/about", headers=headers, timeout=15, follow_redirects=True)
         html = r.text
-
         results = {"html_len": len(html), "found": {}}
-
-        # 搜索关键词直接在 HTML
         for kw in ["instagram", "facebook", "tiktok", "twitter", "bookl3dge", "goodnews"]:
             if kw.lower() in html.lower():
                 idx = html.lower().find(kw.lower())
                 results["found"][kw] = html[max(0, idx-80):idx+120]
-
-        # 尝试提取 ytInitialData
         m = re.search(r'var ytInitialData\s*=\s*(\{.{100,}?\});\s*(?:var |</script>)', html, re.DOTALL)
         if m:
             results["ytInitialData_found"] = True
@@ -493,7 +531,6 @@ async def debug_links(url: str = "https://www.youtube.com/@bookledge"):
                 results["ytInitialData_parse_error"] = str(e)
         else:
             results["ytInitialData_found"] = False
-
         return JSONResponse(results)
 
 
