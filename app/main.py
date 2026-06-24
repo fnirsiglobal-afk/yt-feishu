@@ -111,8 +111,9 @@ async def fetch_channel_links(client: httpx.AsyncClient, channel_url: str) -> st
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         }
+        clean_url = re.sub(r'/(videos|shorts|playlists|community|featured)(/.*)?$', '', channel_url.rstrip("/"))
         r = await client.get(
-            channel_url.rstrip("/") + "/about",
+            clean_url + "/about",
             headers=headers, timeout=15, follow_redirects=True
         )
         html = r.text
@@ -274,10 +275,10 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
         "近6条最高播":   max_views,
         "近6条最低播":   min_views,
         # ✅ 修复：无社媒链接时不写入该字段，避免空 link 导致飞书静默丢弃整条记录
-        "INS":           hyperlink(social.get("INS")) or {"text": "/", "link": ""},
-        "X":             hyperlink(social.get("X")) or {"text": "/", "link": ""},
-        "FB":            hyperlink(social.get("FB")) or {"text": "/", "link": ""},
-        "TK":            hyperlink(social.get("TK")) or {"text": "/", "link": ""},
+        "INS":           hyperlink(social.get("INS")),
+        "X":             hyperlink(social.get("X")),
+        "FB":            hyperlink(social.get("FB")),
+        "TK":            hyperlink(social.get("TK")),
         "最后更新时间":  now_ts(),
         # 刷新完成后把状态写回「已完成」
         "刷新状态":      STATUS_DONE,
