@@ -274,10 +274,10 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
         "近6条最高播":   max_views,
         "近6条最低播":   min_views,
         # ✅ 修复：无社媒链接时不写入该字段，避免空 link 导致飞书静默丢弃整条记录
-        "INS":           hyperlink(social.get("INS")),
-        "X":             hyperlink(social.get("X")),
-        "FB":            hyperlink(social.get("FB")),
-        "TK":            hyperlink(social.get("TK")),
+        "INS":           hyperlink(social.get("INS")) or {"text": "/", "link": ""},
+        "X":             hyperlink(social.get("X")) or {"text": "/", "link": ""},
+        "FB":            hyperlink(social.get("FB")) or {"text": "/", "link": ""},
+        "TK":            hyperlink(social.get("TK")) or {"text": "/", "link": ""},
         "最后更新时间":  now_ts(),
         # 刷新完成后把状态写回「已完成」
         "刷新状态":      STATUS_DONE,
