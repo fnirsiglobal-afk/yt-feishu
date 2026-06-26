@@ -263,7 +263,7 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
     country_name = COUNTRY_MAP.get(country_code, country_code) or None
 
     fields = {
-        "频道链接":      hyperlink(channel_url.strip()),
+        "频道":      hyperlink(channel_url.strip()),
         "频道名称":      snippet.get("title", ""),
         "国家/地区":     country_name,
         "邮箱":          email or None,
@@ -271,9 +271,9 @@ async def fetch_channel_fields(client: httpx.AsyncClient, channel_url: str) -> d
                          if not stats.get("hiddenSubscriberCount") and stats.get("subscriberCount")
                          else None,
         "最新发布时间":  latest_publish,
-        "近6条均播":     avg_views,
-        "近6条最高播":   max_views,
-        "近6条最低播":   min_views,
+        "均播":     avg_views,
+        "最高播":   max_views,
+        "最低播":   min_views,
         # ✅ 修复：无社媒链接时不写入该字段，避免空 link 导致飞书静默丢弃整条记录
         "INS":           hyperlink(social.get("INS")),
         "X":             hyperlink(social.get("X")),
@@ -333,7 +333,7 @@ async def list_all_records(client: httpx.AsyncClient, token: str) -> list:
     """
     records = []
     page_token = None
-    field_names = '["频道链接","刷新状态","最后更新时间"]'
+    field_names = '["频道","刷新状态","最后更新时间"]'
     while True:
         params = {"page_size": 100, "field_names": field_names}
         if page_token:
@@ -354,7 +354,7 @@ async def list_all_records(client: httpx.AsyncClient, token: str) -> list:
             fields = item.get("fields", {})
 
             # 解析频道链接
-            url_field = fields.get("频道链接")
+            url_field = fields.get("频道")
             if isinstance(url_field, dict):
                 ch_url = url_field.get("link", "") or url_field.get("text", "")
             elif isinstance(url_field, str):
